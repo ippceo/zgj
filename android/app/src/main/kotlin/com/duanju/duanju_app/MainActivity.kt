@@ -18,6 +18,7 @@ import androidx.core.content.FileProvider
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.security.MessageDigest
 
 class MainActivity : FlutterActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -75,6 +76,13 @@ class MainActivity : FlutterActivity() {
                         return@setMethodCallHandler
                     }
                     result.success(installApk(path))
+                } else if (call.method == "verifyUpdateApk") {
+                    val path = call.argument<String>("path")
+                    if (path.isNullOrEmpty()) {
+                        result.success("missing")
+                        return@setMethodCallHandler
+                    }
+                    result.success(verifyUpdateApk(path))
                 } else if (call.method == "openInstallSettings") {
                     result.success(openInstallSettings())
                 } else {
@@ -208,14 +216,66 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /**
+     * 校验更新包：包名必须一致，且签名证书必须与本应用相同。
+     *
+     * 返回 ok / missing / invalid / package_mismatch / signature_mismatch。
+     * 比较的是运行时读到的本应用证书，因此更换签名后的首次升级会被拒绝，
+     * 需要用户手动卸载重装。
+     */
+    private fun verifyUpdateApk(path: String): String {
+        val file = File(path)
+        if (!file.exists()) return "missing"
+        val archive = archiveIdentity(file) ?: return "invalid"
+        val current = packageIdentity() ?: return "invalid"
+        if (archive.first != packageName) return "package_mismatch"
+        if (!archive.second.equals(current, ignoreCase = true)) return "signature_mismatch"
+        return "ok"
+    }
+
+    @Suppress("DEPRECATION")
+    private fun archiveIdentity(file: File): Pair<String, String>? {
+        val info = packageManager.getPackageArchiveInfo(
+            file.path,
+            PackageManager.GET_SIGNATURES,
+        ) ?: return null
+        val digest = signatureDigest(info.signatures?.firstOrNull()) ?: return null
+        return info.packageName to digest
+    }
+
+    @Suppress("DEPRECATION")
+    private fun packageIdentity(): String? {
+        val info = packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
+        return signatureDigest(info.signatures?.firstOrNull())
+    }
+
+    private fun signatureDigest(signature: android.content.pm.Signature?): String? {
+        if (signature == null) return null
+        val digest = MessageDigest.getInstance("SHA-256").digest(signature.toByteArray())
+        return digest.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    }
+
     /** 通过 FileProvider 拉起系统安装界面。 */
     private fun installApk(path: String): String {
         val file = File(path)
         if (!file.exists()) return "missing"
         if (!canInstallPackages()) return "no_permission"
+        val canonical = try {
+            file.canonicalFile
+        } catch (e: Exception) {
+            return "failed:${e.javaClass.simpleName}"
+        }
+        val root = try {
+            File(cacheDir, "updates").canonicalPath
+        } catch (e: Exception) {
+            return "failed:${e.javaClass.simpleName}"
+        }
+        if (!canonical.path.startsWith(root + File.separator)) {
+            return "failed:路径不在更新缓存目录"
+        }
         return try {
             val uri = FileProvider.getUriForFile(
-                this, "$packageName.updateprovider", file
+                this, "$packageName.updateprovider", canonical
             )
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, "application/vnd.android.package-archive")

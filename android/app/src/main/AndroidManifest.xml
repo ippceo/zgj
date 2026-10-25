@@ -16,7 +16,7 @@
         android:name="${applicationName}"
         android:icon="@drawable/app_icon"
         android:banner="${appBanner}"
-        android:usesCleartextTraffic="true"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:allowBackup="false">
         <activity
             android:name=".MainActivity"

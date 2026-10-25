@@ -88,7 +88,8 @@ type nativeLANServer struct {
 	generation  string
 	config      nativeLANConfig
 	server      *http.Server
-	listener    net.Listener
+	listeners   []net.Listener
+	port        int
 	events      chan nativeLANEvent
 	pending     map[string]chan nativeLANReply
 	requests    map[string]context.CancelFunc
@@ -177,6 +178,61 @@ func nativeLANPrivate(host string) bool {
 	return ip != nil && (ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLoopback())
 }
 
+func nativeLANHosts() []string {
+	seen := map[string]bool{}
+	hosts := []string{}
+	interfaces, _ := net.Interfaces()
+	for _, network := range interfaces {
+		if network.Flags&net.FlagUp == 0 {
+			continue
+		}
+		rows, _ := network.Addrs()
+		for _, row := range rows {
+			value := row.String()
+			if zone := strings.IndexByte(value, '%'); zone >= 0 {
+				if slash := strings.IndexByte(value, '/'); slash > zone {
+					value = value[:zone] + value[slash:]
+				}
+			}
+			host, _, err := net.ParseCIDR(value)
+			if err != nil || !nativeLANPrivate(host.String()) {
+				continue
+			}
+			text := host.String()
+			if host.IsLinkLocalUnicast() && host.To4() == nil {
+				text += "%" + network.Name
+			}
+			if seen[text] {
+				continue
+			}
+			seen[text] = true
+			hosts = append(hosts, text)
+		}
+	}
+	if len(hosts) == 0 {
+		hosts = append(hosts, "127.0.0.1")
+	}
+	return hosts
+}
+
+func nativeLANListeners() ([]net.Listener, int, error) {
+	hosts := nativeLANHosts()
+	first, err := net.Listen("tcp", net.JoinHostPort(hosts[0], "0"))
+	if err != nil {
+		return nil, 0, errors.New("无法打开局域网接收端口")
+	}
+	port := first.Addr().(*net.TCPAddr).Port
+	listeners := []net.Listener{first}
+	for _, host := range hosts[1:] {
+		next, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		if err != nil {
+			continue
+		}
+		listeners = append(listeners, next)
+	}
+	return listeners, port, nil
+}
+
 func nativeLANAddress(address string) (string, error) {
 	host, port, err := net.SplitHostPort(address)
 	number, parseErr := strconv.Atoi(port)
@@ -228,13 +284,13 @@ func newNativeLANServer(directory string, config nativeLANConfig) (*nativeLANSer
 	if err != nil {
 		return nil, err
 	}
-	listener, err := net.Listen("tcp", ":0")
+	listeners, port, err := nativeLANListeners()
 	if err != nil {
-		return nil, errors.New("无法打开局域网接收端口")
+		return nil, err
 	}
 	link := &nativeLANServer{
 		identity: identity, cert: cert, pin: nativeLANFingerprint(leaf), generation: generation, config: config,
-		listener: listener, events: make(chan nativeLANEvent, 16), pending: map[string]chan nativeLANReply{},
+		listeners: listeners, port: port, events: make(chan nativeLANEvent, 16), pending: map[string]chan nativeLANReply{},
 		requests: map[string]context.CancelFunc{}, rates: map[string]nativeLANRate{}, done: make(chan struct{}),
 		slots: make(chan struct{}, 16),
 	}
@@ -247,7 +303,11 @@ func newNativeLANServer(directory string, config nativeLANConfig) (*nativeLANSer
 			ClientAuth: tls.RequireAnyClientCert,
 		},
 	}
-	go func() { _ = link.server.Serve(tls.NewListener(listener, link.server.TLSConfig)) }()
+	for _, listener := range listeners {
+		go func(current net.Listener) {
+			_ = link.server.Serve(tls.NewListener(current, link.server.TLSConfig))
+		}(listener)
+	}
 	return link, nil
 }
 
@@ -255,6 +315,9 @@ func (link *nativeLANServer) close() {
 	link.closeOnce.Do(func() {
 		close(link.done)
 		_ = link.server.Close()
+		for _, listener := range link.listeners {
+			_ = listener.Close()
+		}
 		link.mu.Lock()
 		for _, cancel := range link.requests {
 			cancel()
@@ -269,24 +332,17 @@ func (link *nativeLANServer) info(private bool) map[string]any {
 	link.mu.Lock()
 	defer link.mu.Unlock()
 	addresses := []string{}
-	interfaces, _ := net.Interfaces()
-	port := link.listener.Addr().(*net.TCPAddr).Port
-	for _, network := range interfaces {
-		if network.Flags&net.FlagUp == 0 || network.Flags&net.FlagLoopback != 0 {
+	port := link.port
+	for _, listener := range link.listeners {
+		address, ok := listener.Addr().(*net.TCPAddr)
+		if !ok || address.IP.IsLoopback() || address.IP.IsUnspecified() {
 			continue
 		}
-		rows, _ := network.Addrs()
-		for _, row := range rows {
-			host, _, err := net.ParseCIDR(row.String())
-			if err != nil || !nativeLANPrivate(host.String()) || host.IsLoopback() {
-				continue
-			}
-			text := host.String()
-			if host.IsLinkLocalUnicast() && host.To4() == nil {
-				text += "%" + network.Name
-			}
-			addresses = append(addresses, net.JoinHostPort(text, strconv.Itoa(port)))
+		text := address.IP.String()
+		if address.Zone != "" {
+			text += "%" + address.Zone
 		}
+		addresses = append(addresses, net.JoinHostPort(text, strconv.Itoa(port)))
 	}
 	result := map[string]any{
 		"deviceId": link.identity.ID, "name": link.config.Name, "kind": link.config.Kind,

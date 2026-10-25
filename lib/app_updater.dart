@@ -24,8 +24,12 @@ class AppUpdater {
   AppUpdater._();
 
   /// 发布仓库（用户自有仓库，README 已标明原作者 Topkill/guoapp3）。
-  static const _owner = 'kuoluoss';
-  static const _repo = 'zhenguojian';
+  ///
+  /// fork 后可用 `--dart-define=UPDATE_OWNER=...&UPDATE_REPO=...` 指向自己的仓库。
+  static const _owner =
+      String.fromEnvironment('UPDATE_OWNER', defaultValue: 'kuoluoss');
+  static const _repo =
+      String.fromEnvironment('UPDATE_REPO', defaultValue: 'zhenguojian');
 
   /// GitHub API 直连地址（国内可能不通，失败即静默跳过）。
   static const _apiUrl =
@@ -50,6 +54,30 @@ class AppUpdater {
 
   /// 下载加速镜像前缀（用于 APK 下载兜底，实测可用）。
   static const _mirrorPrefix = 'https://ghfast.top/';
+
+  /// 允许下载安装包的域名与后缀。重定向只在这份名单内跟随，
+  /// 防止镜像或中间人把下载引到任意主机。
+  static const _trustedHosts = {
+    'github.com',
+    'api.github.com',
+    'ghfast.top',
+    'gh-proxy.com',
+  };
+
+  static const _trustedSuffixes = [
+    '.github.com',
+    '.githubusercontent.com',
+    '.ghfast.top',
+    '.gh-proxy.com',
+  ];
+
+  static bool _trustedUpdateUri(Uri uri) {
+    if (uri.scheme != 'https') return false;
+    final host = uri.host.toLowerCase();
+    if (host.isEmpty) return false;
+    if (_trustedHosts.contains(host)) return true;
+    return _trustedSuffixes.any(host.endsWith);
+  }
 
   /// **API 代理**前缀（用于 API 兜底）。
   ///
@@ -691,7 +719,10 @@ class AppUpdater {
       Navigator.of(context, rootNavigator: true).pop(); // 关闭进度框
 
       if (file == null) {
-        _toast(context, '下载失败，请稍后重试');
+        _toast(
+          context,
+          lastFailureReason.isEmpty ? '下载失败，请稍后重试' : lastFailureReason,
+        );
         return;
       }
       final status = await _install(file);
@@ -729,9 +760,16 @@ class AppUpdater {
     } catch (_) {
       directory = Directory.systemTemp;
     }
+    final downloads = Directory('${directory.path}/updates');
+    try {
+      await downloads.create(recursive: true);
+    } catch (_) {
+      return null;
+    }
     final target = File(
-      '${directory.path}/zhenguojian-update-${release.apkName}',
+      '${downloads.path}/${_updateFileName(release.apkName)}',
     );
+    lastFailureReason = '';
 
     // 下载同样需要走系统代理：否则 VPN 下会出现"能检测到更新、却下载不动"。
     // 0.5.1：`ghfast.top` 对**文件下载**可用（实测 200），故仍作下载兜底；
@@ -748,9 +786,46 @@ class AppUpdater {
         onProgress: onProgress,
         proxy: proxy,
       );
-      if (ok) return target;
+      if (!ok) {
+        _removeQuietly(target);
+        continue;
+      }
+      final status = await _verifyUpdate(target);
+      if (status == 'ok') return target;
+      _removeQuietly(target);
+      lastFailureReason = switch (status) {
+        'signature_mismatch' => '更新包签名与本应用不一致，已中止更新',
+        'package_mismatch' => '更新包包名不一致，已中止更新',
+        _ => '更新包校验未通过，已中止更新',
+      };
+      return null;
     }
     return null;
+  }
+
+  static String _updateFileName(String name) {
+    final base = name.split('/').last.split('\\').last;
+    final cleaned = base.replaceAll(RegExp(r'[^A-Za-z0-9._+-]'), '_');
+    return cleaned.isEmpty || cleaned.startsWith('.') ? 'update.apk' : cleaned;
+  }
+
+  static void _removeQuietly(File file) {
+    try {
+      if (file.existsSync()) file.deleteSync();
+    } catch (_) {}
+  }
+
+  /// 交给原生侧核对包名与签名证书；只有 ok 才允许安装。
+  static Future<String> _verifyUpdate(File file) async {
+    try {
+      const channel = MethodChannel('duanju/updater');
+      final status = await channel.invokeMethod<String>('verifyUpdateApk', {
+        'path': file.path,
+      });
+      return status ?? 'invalid';
+    } catch (error) {
+      return 'failed:$error';
+    }
   }
 
   static Future<bool> _downloadFrom(
@@ -763,7 +838,9 @@ class AppUpdater {
     _applyProxy(client, proxy);
     client.connectionTimeout = const Duration(seconds: 10);
     try {
-      var request = await client.getUrl(Uri.parse(url));
+      final start = Uri.parse(url);
+      if (!_trustedUpdateUri(start)) return false;
+      var request = await client.getUrl(start);
       request.headers.set(HttpHeaders.userAgentHeader, 'zhenguojian-updater');
       var response = await request.close().timeout(const Duration(seconds: 15));
 
@@ -772,7 +849,9 @@ class AppUpdater {
       while (response.isRedirect && redirects < 5) {
         final location = response.headers.value(HttpHeaders.locationHeader);
         if (location == null) break;
-        request = await client.getUrl(Uri.parse(location));
+        final next = Uri.parse(location);
+        if (!_trustedUpdateUri(next)) return false;
+        request = await client.getUrl(next);
         request.headers.set(HttpHeaders.userAgentHeader, 'zhenguojian-updater');
         response = await request.close().timeout(const Duration(seconds: 15));
         redirects++;
@@ -793,6 +872,7 @@ class AppUpdater {
       await sink.close();
 
       // 基本校验：APK 必须是有效 ZIP（PK 开头），避免把错误页当成安装包。
+      if (total > 0 && received != total) return false;
       if (target.lengthSync() < 1024 * 1024) return false;
       final raf = target.openSync();
       final header = raf.readSync(2);
